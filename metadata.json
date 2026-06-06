@@ -1,0 +1,6 @@
+{
+  "name": "MQTT Multi-Broker Voice Console",
+  "description": "IoT Web Interface for ESP32 with DHT11, 4 relays, voice commands, and multi-broker MQTT synchronizer.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
