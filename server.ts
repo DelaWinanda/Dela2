@@ -183,6 +183,44 @@ function connectToBroker(index: number) {
   }
 }
 
+// ================= PERPINDAHAN BROKER GRACEFUL (ESP32 SYNC) =================
+function switchBroker(targetIndex: number) {
+  if (targetIndex === activeBrokerIndex) {
+    addLog('broker', `Sistem sudah berada di Broker [${brokerList[targetIndex].nama}].`);
+    return;
+  }
+
+  const brokerValueStr = (targetIndex + 1).toString(); // "1", "2", atau "3"
+  
+  if (mqttClient && mqttStatus === 'connected') {
+    addLog('broker', `Mengirim perintah ganti broker (${brokerList[targetIndex].nama}) ke ESP32 via [${brokerList[activeBrokerIndex].nama}]...`);
+    
+    let alreadySwitched = false;
+    const executeSwitch = () => {
+      if (!alreadySwitched) {
+        alreadySwitched = true;
+        connectToBroker(targetIndex);
+      }
+    };
+
+    mqttClient.publish('kontrol/broker', brokerValueStr, { qos: 1 }, (err) => {
+      if (err) {
+        console.error("Gagal mempublikasikan pergantian broker:", err);
+      } else {
+        console.log("Pergantian broker berhasil dipublikasikan ke broker lama.");
+      }
+      // Memberi jeda 850ms agar paket terkirim penuh & ESP32 mendeteksi sebelum socket ditutup
+      setTimeout(executeSwitch, 850);
+    });
+
+    // Safety timeout (1.6 detik) sebagai pelapis jika server broker lambat merespon QoS 1
+    setTimeout(executeSwitch, 1600);
+  } else {
+    addLog('command', `Mengalihkan broker web langsung ke [${brokerList[targetIndex].nama}] (Koneksi broker lama offline/inaktif).`);
+    connectToBroker(targetIndex);
+  }
+}
+
 // Handler pesan MQTT masuk (Sinkronisasi Web + ESP32)
 function handleMqttIncoming(topic: string, msg: string) {
   if (topic === 'sensor/suhu') {
@@ -307,10 +345,11 @@ app.post("/api/simulator", (req, res) => {
 app.post("/api/control", (req, res) => {
   const { topic, message } = req.body;
   
-  if (mqttClient && mqttStatus === 'connected') {
+  // Publish normal kecuali untuk penanganan broker (karena ditangani oleh switchBroker dengan callback tertunda)
+  if (topic !== "kontrol/broker" && mqttClient && mqttStatus === 'connected') {
     mqttClient.publish(topic, message, { qos: 1 });
     addLog('command', `Mengirim MQTT [${topic}]: ${message}`);
-  } else {
+  } else if (topic !== "kontrol/broker") {
     addLog('command', `Mengirim Lokalnya (MQTT terputus) [${topic}]: ${message}`);
   }
 
@@ -340,7 +379,7 @@ app.post("/api/control", (req, res) => {
   } else if (topic === "kontrol/broker") {
     const val = parseInt(message) - 1;
     if (val >= 0 && val < brokerList.length) {
-      connectToBroker(val);
+      switchBroker(val);
     }
   }
 
@@ -508,20 +547,17 @@ app.post("/api/voice-command", async (req, res) => {
     matchFound = true;
   } else if (query.includes('broker') || query.includes('pindah') || query.includes('ganti')) {
     if (query.includes('satu') || query.includes(' 1') || query.includes('cloudamqp')) {
-      connectToBroker(0);
-      if (mqttClient && mqttStatus === 'connected') mqttClient.publish('kontrol/broker', '1', { qos: 1 });
+      switchBroker(0);
       actionText = "Pindah ke Broker CloudAMQP";
       speechResponse = "Siap, beralih ke broker satu CloudAMQP sekarang.";
       matchFound = true;
     } else if (query.includes('dua') || query.includes(' 2') || query.includes('cedalo')) {
-      connectToBroker(1);
-      if (mqttClient && mqttStatus === 'connected') mqttClient.publish('kontrol/broker', '2', { qos: 1 });
+      switchBroker(1);
       actionText = "Pindah ke Broker Cedalo";
       speechResponse = "Siap, beralih ke broker dua Cedalo sekarang.";
       matchFound = true;
     } else if (query.includes('tiga') || query.includes(' 3') || query.includes('flespi')) {
-      connectToBroker(2);
-      if (mqttClient && mqttStatus === 'connected') mqttClient.publish('kontrol/broker', '3', { qos: 1 });
+      switchBroker(2);
       actionText = "Pindah ke Broker Flespi";
       speechResponse = "Siap, beralih ke broker tiga Flespi sekarang.";
       matchFound = true;
@@ -603,10 +639,7 @@ app.post("/api/voice-command", async (req, res) => {
         } else if (result.action === 'switch_broker' && result.value !== 'none') {
           const bIdx = parseInt(result.value) - 1;
           if (bIdx >= 0 && bIdx < brokerList.length) {
-            connectToBroker(bIdx);
-            if (mqttClient && mqttStatus === 'connected') {
-              mqttClient.publish('kontrol/broker', result.value, { qos: 1 });
-            }
+            switchBroker(bIdx);
             actionText = `AI Pindah Broker: ${brokerList[bIdx].nama}`;
           }
           speechResponse = result.speechResponse;
