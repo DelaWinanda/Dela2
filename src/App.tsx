@@ -53,8 +53,10 @@ export default function App() {
 
   // --- SANDBOX/VERCEL AUTODETECT FALLBACK ---
   const [isSandboxMode, setIsSandboxMode] = useState<boolean>(false);
+  const [isPollingMode, setIsPollingMode] = useState<boolean>(false);
 
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
 
   // Helper to add local client-side logs
   const addLocalLog = (message: string, type: 'info' | 'error' | 'command' | 'sensor' | 'broker' = 'info') => {
@@ -70,7 +72,7 @@ export default function App() {
     });
   };
 
-  // --- CONNECT TO BACKEND SERVER-SENT EVENTS WITH CLIENT-SIDE AUTO-FALLBACK ---
+  // --- CONNECT TO BACKEND SERVER-SENT EVENTS WITH EXCELLENT RELIABILITY ---
   useEffect(() => {
     // 1. Immediately activate sandbox mode if we are deployed to Vercel (since Vercel doesn't run background threads or SSE)
     const host = window.location.hostname;
@@ -86,19 +88,26 @@ export default function App() {
     }
 
     // 2. Otherwise try connecting via SSE (standard Express container mode)
-    const eventSource = new EventSource('/api/events');
+    let eventSource: EventSource | null = new EventSource('/api/events');
+    let sseActive = false;
     
-    // Set a timeout: if we don't get any signal in 3 seconds, we fallback to Sandbox Mode
+    // Set a timeout: if we don't get any SSE signal in 6 seconds, we fallback to HTTP Polling Mode, keeping it connected to the real server and physical ESP32!
     const fallbackTimer = setTimeout(() => {
-      setIsSandboxMode(true);
-      setMqttStatus('connected');
-      addLocalLog("SSE Connection inactive. Enabling local Client Sandbox Mode...", "info");
-      addLocalLog("Connected to broker: CloudAMQP (TLS Emulator)", "broker");
-    }, 3000);
+      if (!sseActive) {
+        setIsPollingMode(true);
+        addLocalLog("SSE stream slow or buffered. Switching to HTTP Polling... (Still connected to real ESP32)", "info");
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+      }
+    }, 6000);
 
     eventSource.onmessage = (event) => {
       clearTimeout(fallbackTimer);
+      sseActive = true;
       setIsSandboxMode(false); // Valid real-time sever container is answering!
+      setIsPollingMode(false);
       try {
         const data = JSON.parse(event.data);
         setRelays(data.relays);
@@ -117,15 +126,58 @@ export default function App() {
     };
 
     eventSource.onerror = (err) => {
-      console.error("SSE Connection failed or broken.", err);
-      // Let the fallback timer activate sandbox mode if it fails completely
+      console.warn("SSE Connection failed or broken. Switching to HTTP Polling to maintain real ESP32 connection...", err);
+      clearTimeout(fallbackTimer);
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+      setIsPollingMode(true);
     };
 
     return () => {
-      eventSource.close();
+      if (eventSource) {
+        eventSource.close();
+      }
       clearTimeout(fallbackTimer);
     };
   }, []);
+
+  // --- HTTP STATUS POLLING (Activates when SSE is slow or blocked by container reverse-proxy) ---
+  useEffect(() => {
+    let intervalId: any = null;
+    
+    if (isPollingMode && !isSandboxMode) {
+      const fetchStatus = async () => {
+        try {
+          const resp = await fetch('/api/status');
+          if (resp.ok) {
+            const data = await resp.json();
+            setRelays(data.relays);
+            setVariations(data.variations);
+            setSensors(data.sensors);
+            setActiveBroker(data.activeBroker);
+            setMqttStatus(data.mqttStatus);
+            setMqttError(data.mqttError || "");
+            setSimulatorActive(data.simulatorActive);
+            if (data.logs) {
+              setLogs(data.logs);
+            }
+          }
+        } catch (err) {
+          console.warn("Polling status failed:", err);
+        }
+      };
+
+      // Fetch immediately, then every 2.5s
+      fetchStatus();
+      intervalId = setInterval(fetchStatus, 2500);
+    }
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [isPollingMode, isSandboxMode]);
 
   // --- CLIENT-SIDE SENSOR SIMULATION (Active only in Sandbox mode) ---
   useEffect(() => {
@@ -157,7 +209,9 @@ export default function App() {
 
   // --- AUTO SCROLL LOGGER ---
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    }
   }, [logs]);
 
   // --- PUBLISH COMMAND API WITH FLUID FALLBACK TO COMPATIBLE CLIENT STATES ---
@@ -833,7 +887,10 @@ export default function App() {
             </div>
 
             {/* Terminal logs list */}
-            <div className="flex-1 overflow-y-auto font-mono text-[11px] leading-relaxed pr-1 space-y-1 scrollbar-thin scrollbar-thumb-slate-800">
+            <div 
+              ref={logsContainerRef}
+              className="flex-1 overflow-y-auto font-mono text-[11px] leading-relaxed pr-1 space-y-1 scrollbar-thin scrollbar-thumb-slate-800"
+            >
               {filteredLogs.length === 0 ? (
                 <div className="text-slate-500 py-6 text-center italic">
                   Belum ada log aktivitas terdeteksi.
