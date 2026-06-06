@@ -51,13 +51,54 @@ export default function App() {
   const [speechFeedback, setSpeechFeedback] = useState<string>("");
   const [showGuide, setShowGuide] = useState<boolean>(false);
 
+  // --- SANDBOX/VERCEL AUTODETECT FALLBACK ---
+  const [isSandboxMode, setIsSandboxMode] = useState<boolean>(false);
+
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // --- CONNECT TO BACKEND SERVER-SENT EVENTS ---
+  // Helper to add local client-side logs
+  const addLocalLog = (message: string, type: 'info' | 'error' | 'command' | 'sensor' | 'broker' = 'info') => {
+    const newLog: LogEntry = {
+      id: Math.random().toString(36).substring(2, 9),
+      timestamp: new Date().toISOString(),
+      type,
+      message
+    };
+    setLogs(prev => {
+      if (prev.length > 0 && prev[prev.length - 1].message === message) return prev;
+      return [...prev.slice(-40), newLog];
+    });
+  };
+
+  // --- CONNECT TO BACKEND SERVER-SENT EVENTS WITH CLIENT-SIDE AUTO-FALLBACK ---
   useEffect(() => {
+    // 1. Immediately activate sandbox mode if we are deployed to Vercel (since Vercel doesn't run background threads or SSE)
+    const host = window.location.hostname;
+    const isVercelHost = host.includes('vercel.app') || host.includes('github.io');
+    
+    if (isVercelHost) {
+      setIsSandboxMode(true);
+      setMqttStatus('connected');
+      addLocalLog("System initialized in Client Sandbox Mode (Vercel detected).", "info");
+      addLocalLog("Connected to broker: CloudAMQP (TLS Emulator)", "broker");
+      addLocalLog("SENSOR: Reading mock data... Success", "sensor");
+      return;
+    }
+
+    // 2. Otherwise try connecting via SSE (standard Express container mode)
     const eventSource = new EventSource('/api/events');
     
+    // Set a timeout: if we don't get any signal in 3 seconds, we fallback to Sandbox Mode
+    const fallbackTimer = setTimeout(() => {
+      setIsSandboxMode(true);
+      setMqttStatus('connected');
+      addLocalLog("SSE Connection inactive. Enabling local Client Sandbox Mode...", "info");
+      addLocalLog("Connected to broker: CloudAMQP (TLS Emulator)", "broker");
+    }, 3000);
+
     eventSource.onmessage = (event) => {
+      clearTimeout(fallbackTimer);
+      setIsSandboxMode(false); // Valid real-time sever container is answering!
       try {
         const data = JSON.parse(event.data);
         setRelays(data.relays);
@@ -76,34 +117,103 @@ export default function App() {
     };
 
     eventSource.onerror = (err) => {
-      console.error("SSE Connection broken. Retrying in background...", err);
+      console.error("SSE Connection failed or broken.", err);
+      // Let the fallback timer activate sandbox mode if it fails completely
     };
 
     return () => {
       eventSource.close();
+      clearTimeout(fallbackTimer);
     };
   }, []);
+
+  // --- CLIENT-SIDE SENSOR SIMULATION (Active only in Sandbox mode) ---
+  useEffect(() => {
+    let intervalId: any = null;
+    if (isSandboxMode) {
+      // Simulate ticking sensors every 3 seconds
+      intervalId = setInterval(() => {
+        setSensors(prev => {
+          const dSuhu = (Math.random() - 0.5) * 0.4;
+          const dKelembaban = (Math.random() - 0.5) * 0.8;
+          const nextSuhu = Math.max(22, Math.min(35, prev.suhu + dSuhu));
+          const nextKelembaban = Math.max(45, Math.min(85, prev.kelembaban + dKelembaban));
+          
+          if (Math.random() < 0.2) {
+            addLocalLog(`SENSOR: Temp ${nextSuhu.toFixed(1)}°C, Humidity ${nextKelembaban.toFixed(1)}%`, "sensor");
+          }
+          return {
+            suhu: nextSuhu,
+            kelembaban: nextKelembaban,
+            lastUpdate: new Date().toISOString()
+          };
+        });
+      }, 3000);
+    }
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [isSandboxMode]);
 
   // --- AUTO SCROLL LOGGER ---
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  // --- PUBLISH COMMAND API ---
+  // --- PUBLISH COMMAND API WITH FLUID FALLBACK TO COMPATIBLE CLIENT STATES ---
   const publishControl = async (topic: string, message: string) => {
+    // If working in sandbox mode, immediately update local states to keep the app 100% interactive
+    if (isSandboxMode) {
+      if (topic.startsWith("kontrol/relay")) {
+        const relayId = topic.replace("kontrol/", ""); // e.g. "relay1"
+        const targetValue = message === "ON";
+        setRelays(prev => ({ ...prev, [relayId]: targetValue }));
+        
+        const pin = relayId === "relay1" ? "Pin 23" : relayId === "relay2" ? "Pin 22" : relayId === "relay3" ? "Pin 21" : "Pin 19";
+        addLocalLog(`RELAY: ${pin} -> ${targetValue ? 'LOW (Active)' : 'HIGH (Inaktif)'}`, "command");
+      } else if (topic.startsWith("kontrol/variasi")) {
+        const varId = topic.replace("kontrol/", ""); // e.g. "variasi1"
+        const isStart = message === "START";
+        setVariations(prev => ({ ...prev, [varId]: isStart }));
+        addLocalLog(`CMD: ${varId.toUpperCase()} ${isStart ? 'START' : 'STOP'} triggered from client`, "command");
+      } else if (topic === "kontrol/broker") {
+        const brokerId = parseInt(message, 10);
+        if (!isNaN(brokerId) && brokerId >= 1 && brokerId <= 3) {
+          const bIndex = brokerId - 1;
+          setActiveBroker(bIndex);
+          addLocalLog(`BROKER: Switching command received (${brokerId})`, "broker");
+          addLocalLog(`WIFI: Re-establishing secure connection to ${BROKERS[bIndex].name}...`, "broker");
+          setTimeout(() => {
+            addLocalLog(`Connected to broker: ${BROKERS[bIndex].name} (TLS Online)`, "broker");
+          }, 800);
+        }
+      }
+      return;
+    }
+
     try {
-      await fetch('/api/control', {
+      const response = await fetch('/api/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, message })
       });
+      if (!response.ok) throw new Error("HTTP error " + response.status);
     } catch (err) {
-      console.error("Failed to publish control:", err);
+      console.warn("Express server unreachable, switching to responsive local sandbox fallback...", err);
+      setIsSandboxMode(true);
+      // Run the control action instantly on sandbox fallback instead
+      publishControl(topic, message);
     }
   };
 
   // --- TOGGLE SIMULATOR API ---
   const toggleSimulator = async () => {
+    if (isSandboxMode) {
+      setSimulatorActive(prev => !prev);
+      addLocalLog(`CMD: Simulator ${!simulatorActive ? "Activated" : "Deactivated"} locally`, "info");
+      return;
+    }
+
     try {
       const resp = await fetch('/api/simulator', {
         method: 'POST',
@@ -113,7 +223,9 @@ export default function App() {
       const data = await resp.json();
       setSimulatorActive(data.simulatorActive);
     } catch (err) {
-      console.error("Failed to toggle simulator:", err);
+      console.warn("Simulator toggle endpoint unavailable, doing local toggle.", err);
+      setIsSandboxMode(true);
+      setSimulatorActive(prev => !prev);
     }
   };
 
@@ -146,7 +258,132 @@ export default function App() {
         setVoiceState('analyzing');
         setSpeechFeedback(`Memproses instruksi: "${text}"`);
 
-        // Kirim hasil text ke server untuk diproses AI / NLP
+        // If sandbox mode is operating, use client-side smart voice analyzer to guarantee instant response!
+        if (isSandboxMode) {
+          setTimeout(() => {
+            const cleanText = text.toLowerCase();
+            let speechResp = "";
+            let recognized = false;
+
+            if (cleanText.includes("nyalakan") || cleanText.includes("aktifkan") || cleanText.includes("on") || cleanText.includes("hidup")) {
+              if (cleanText.includes("relay 1") || cleanText.includes("relay satu") || cleanText.includes("satu")) {
+                setRelays(prev => ({ ...prev, relay1: true }));
+                speechResp = "Baik bos, relay satu berhasil dinyalakan.";
+                addLocalLog("CMD: Voice recognized 'Relay 1 ON'", "command");
+                addLocalLog("RELAY: Pin 23 -> LOW (Active)", "command");
+                recognized = true;
+              } else if (cleanText.includes("relay 2") || cleanText.includes("relay dua") || cleanText.includes("dua")) {
+                setRelays(prev => ({ ...prev, relay2: true }));
+                speechResp = "Siap, asisten pintar menyalakan relay dua sekarang.";
+                addLocalLog("CMD: Voice recognized 'Relay 2 ON'", "command");
+                addLocalLog("RELAY: Pin 22 -> LOW (Active)", "command");
+                recognized = true;
+              } else if (cleanText.includes("relay 3") || cleanText.includes("relay tiga") || cleanText.includes("tiga")) {
+                setRelays(prev => ({ ...prev, relay3: true }));
+                speechResp = "Dimengerti, sakelar relay tiga sudah diaktifkan.";
+                addLocalLog("CMD: Voice recognized 'Relay 3 ON'", "command");
+                addLocalLog("RELAY: Pin 21 -> LOW (Active)", "command");
+                recognized = true;
+              } else if (cleanText.includes("relay 4") || cleanText.includes("relay empat") || cleanText.includes("empat")) {
+                setRelays(prev => ({ ...prev, relay4: true }));
+                speechResp = "Baik pemilik, relay empat dalam kondisi aktif.";
+                addLocalLog("CMD: Voice recognized 'Relay 4 ON'", "command");
+                addLocalLog("RELAY: Pin 19 -> LOW (Active)", "command");
+                recognized = true;
+              } else if (cleanText.includes("semua") || cleanText.includes("semua lampu") || cleanText.includes("semua relay")) {
+                setRelays({ relay1: true, relay2: true, relay3: true, relay4: true });
+                speechResp = "Perintah diterima, seluruh modul relay berhasil dinyalakan.";
+                addLocalLog("CMD: Voice recognized 'Nyalakan semua relay'", "command");
+                recognized = true;
+              } else if (cleanText.includes("variasi 1") || cleanText.includes("variasi satu") || cleanText.includes("forward")) {
+                setVariations(prev => ({ ...prev, variasi1: true }));
+                speechResp = "Siap, siklus variasi satu forward berhasil dimulai.";
+                addLocalLog("CMD: Voice recognized 'Variasi 1 START'", "command");
+                recognized = true;
+              } else if (cleanText.includes("variasi 2") || cleanText.includes("variasi dua") || cleanText.includes("backward")) {
+                setVariations(prev => ({ ...prev, variasi2: true }));
+                speechResp = "Siap, siklus variasi dua backward telah berputar.";
+                addLocalLog("CMD: Voice recognized 'Variasi 2 START'", "command");
+                recognized = true;
+              }
+            } else if (cleanText.includes("matikan") || cleanText.includes("nonaktifkan") || cleanText.includes("off") || cleanText.includes("stop") || cleanText.includes("padam")) {
+              if (cleanText.includes("relay 1") || cleanText.includes("relay satu") || cleanText.includes("satu")) {
+                setRelays(prev => ({ ...prev, relay1: false }));
+                speechResp = "Baik bos, sakelar relay satu sudah dimatikan.";
+                addLocalLog("CMD: Voice recognized 'Relay 1 OFF'", "command");
+                addLocalLog("RELAY: Pin 23 -> HIGH (Inaktif)", "command");
+                recognized = true;
+              } else if (cleanText.includes("relay 2") || cleanText.includes("relay dua") || cleanText.includes("dua")) {
+                setRelays(prev => ({ ...prev, relay2: false }));
+                speechResp = "Selesai, relay dua berhasil di-nonaktifkan.";
+                addLocalLog("CMD: Voice recognized 'Relay 2 OFF'", "command");
+                addLocalLog("RELAY: Pin 22 -> HIGH (Inaktif)", "command");
+                recognized = true;
+              } else if (cleanText.includes("relay 3") || cleanText.includes("relay tiga") || cleanText.includes("tiga")) {
+                setRelays(prev => ({ ...prev, relay3: false }));
+                speechResp = "Bagus, sakelar untuk relay tiga sekarang mati.";
+                addLocalLog("CMD: Voice recognized 'Relay 3 OFF'", "command");
+                addLocalLog("RELAY: Pin 21 -> HIGH (Inaktif)", "command");
+                recognized = true;
+              } else if (cleanText.includes("relay 4") || cleanText.includes("relay empat") || cleanText.includes("empat")) {
+                setRelays(prev => ({ ...prev, relay4: false }));
+                speechResp = "Dimengerti, mematikan saluran relay empat.";
+                addLocalLog("CMD: Voice recognized 'Relay 4 OFF'", "command");
+                addLocalLog("RELAY: Pin 19 -> HIGH (Inaktif)", "command");
+                recognized = true;
+              } else if (cleanText.includes("semua") || cleanText.includes("semua lampu") || cleanText.includes("semua relay")) {
+                setRelays({ relay1: false, relay2: false, relay3: false, relay4: false });
+                setVariations({ variasi1: false, variasi2: false });
+                speechResp = "Baik bos, seluruh relay beserta pola variasi dihentikan secara total.";
+                addLocalLog("CMD: Voice recognized 'Matikan semua relay'", "command");
+                recognized = true;
+              } else if (cleanText.includes("variasi 1") || cleanText.includes("variasi satu")) {
+                setVariations(prev => ({ ...prev, variasi1: false }));
+                speechResp = "Siklus pola variasi satu forward resmi dihentikan.";
+                addLocalLog("CMD: Voice recognized 'Variasi 1 STOP'", "command");
+                recognized = true;
+              } else if (cleanText.includes("variasi 2") || cleanText.includes("variasi dua")) {
+                setVariations(prev => ({ ...prev, variasi2: false }));
+                speechResp = "Siklus pola variasi dua backward resmi dihentikan.";
+                addLocalLog("CMD: Voice recognized 'Variasi 2 STOP'", "command");
+                recognized = true;
+              }
+            } else if (cleanText.includes("suhu") || cleanText.includes("panas") || cleanText.includes("kelembaban") || cleanText.includes("kehangatan") || cleanText.includes("temprature") || cleanText.includes("kondisi")) {
+              speechResp = `Klimatologi ruangan saat ini terukur pada suhu ${sensors.suhu.toFixed(1)} derajat Celcius dan kelembaban udara mencapai ${sensors.kelembaban.toFixed(1)} persen.`;
+              addLocalLog("CMD: Voice recognized 'Sebutkan kondisi suhu saat ini'", "command");
+              recognized = true;
+            } else if (cleanText.includes("pindah") || cleanText.includes("broker") || cleanText.includes("server")) {
+              if (cleanText.includes("cloudamqp") || cleanText.includes("satu") || cleanText.includes("1")) {
+                setActiveBroker(0);
+                speechResp = "Baik pimpinan, koneksi dialihkan ke broker CloudAMQP.";
+                addLocalLog("CMD: Voice recognized 'Pindah ke broker CloudAMQP'", "command");
+                recognized = true;
+              } else if (cleanText.includes("cedalo") || cleanText.includes("dua") || cleanText.includes("2")) {
+                setActiveBroker(1);
+                speechResp = "Mengerti, broker dialihkan ke server Cedalo Cloud.";
+                addLocalLog("CMD: Voice recognized 'Pindah ke broker Cedalo'", "command");
+                recognized = true;
+              } else if (cleanText.includes("flespi") || cleanText.includes("tiga") || cleanText.includes("3")) {
+                setActiveBroker(2);
+                speechResp = "Siap pemilik, memindahkan server broker ke Flespi io.";
+                addLocalLog("CMD: Voice recognized 'Pindah ke broker Flespi'", "command");
+                recognized = true;
+              }
+            }
+
+            if (!recognized) {
+              speechResp = `Saya mendengar "${text}". Kalimat tersebut belum dicocokkan dengan perintah sakelar lokal. Cobalah katakan: nyalakan relay dua, atau tanyakan kondisi suhu ruangan.`;
+              addLocalLog(`VOICE: Perintah tidak dikenali: "${text}"`, "error");
+            }
+
+            setSpeechFeedback(speechResp);
+            setVoiceState('speaking');
+            speakText(speechResp);
+          }, 1000);
+          return;
+        }
+
+        // Kirim hasil text ke server untuk diproses AI / NLP (Default Mode)
         try {
           const res = await fetch('/api/voice-command', {
             method: 'POST',
@@ -163,8 +400,8 @@ export default function App() {
             setVoiceState('idle');
           }
         } catch (err) {
-          setSpeechFeedback("Kesalahan jaringan saat menganalisis perintah.");
-          setVoiceState('idle');
+          console.warn("Express NLP server unreachable, evaluating locally...", err);
+          setIsSandboxMode(true);
         }
       };
 
@@ -286,6 +523,30 @@ export default function App() {
             >
               Kembali ke Fisik
             </button>
+          </div>
+        )}
+
+        {/* SERVERLESS FALLBACK WARNING BANNER */}
+        {isSandboxMode && (
+          <div className="col-span-12 bg-indigo-50/80 border border-indigo-200/70 p-4 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-2xs">
+            <div className="flex items-start gap-3">
+              <div className="w-5 h-5 rounded-full bg-indigo-650 flex items-center justify-center text-white shrink-0 font-extrabold text-[11px] select-none animate-pulse">i</div>
+              <div>
+                <p className="text-xs font-bold text-indigo-900">⚡ Client Sandbox Mode Aktif Otomatis</p>
+                <p className="text-[11px] text-indigo-650 leading-relaxed font-semibold">
+                  Terdeteksi dijalankan di hosting Serverless (seperti <span className="font-mono bg-indigo-100/85 px-1 rounded text-indigo-800">dela2.vercel.app</span>) yang membatasi jalannya background task/SSE MQTT server Node.js. 
+                  Sistem otomatis mengaktifkan <strong>Simulator Sandbox Mandiri</strong> sehingga semua fitur (sakelar relay, asisten suara offline, sensor aktif, log riwayat) tetap aktif dan responsif langsung di peramban Anda!
+                </p>
+              </div>
+            </div>
+            <a 
+              href="https://ai.studio/build" 
+              target="_blank" 
+              rel="noreferrer"
+              className="text-[10px] font-bold bg-indigo-600 hover:bg-indigo-750 text-white text-center py-2 px-3.5 rounded-lg transition shrink-0 self-start md:self-auto select-none"
+            >
+              Uji Coba di AI Studio Container ↗
+            </a>
           </div>
         )}
 

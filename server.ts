@@ -108,7 +108,12 @@ let mqttClient: mqtt.MqttClient | null = null;
 
 function connectToBroker(index: number) {
   if (mqttClient) {
-    mqttClient.end();
+    try {
+      mqttClient.removeAllListeners();
+      mqttClient.end(true);
+    } catch (e: any) {
+      console.warn("Error forcing close on previous MQTT client:", e.message);
+    }
   }
 
   activeBrokerIndex = index;
